@@ -1,0 +1,12 @@
+[Unit]
+After=network.target
+
+[Service]
+Type=simple
+User={{USER}}
+ExecStart={{EXEC}}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

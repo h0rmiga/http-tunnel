@@ -1,0 +1,21 @@
+### PROXY SERVER SETTINGS ###
+# host - proxy server address, defaults to 127.0.0.1
+# port - proxy port number, defaults to 3128
+# user - proxy authentication user, defaults to null
+# password - proxy authentication password
+#
+# Example:
+# proxy:
+#   host: 'proxy.company.tld'
+#   port: 8080
+#   user: 'lorem'
+#   password: 'ipsum'
+
+### TUNNEL SETTINGS ###
+# All tunnels must be configured in form:
+#   <local port>: '<remote host>:<remote port>'
+#
+# Example:
+# tunnels:
+#   2222: 'remote.server.tld:22'
+#   2223: 'other.server.tld:22'
