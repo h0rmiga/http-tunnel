@@ -65,29 +65,34 @@ class TunnelServer(object):
         listen_sock.bind(('0.0.0.0', local_port))
         listen_sock.listen(10)
         while True:
-            client_sock, client_addr = listen_sock.accept()
-            client_addr = ':'.join(map(str, client_addr))
-            logging.info('%s - Conection to port %s', client_addr, local_port)
+            try:
+                client_sock, client_addr = listen_sock.accept()
+                client_addr = ':'.join(map(str, client_addr))
+                logging.info('%s - Conection to port %s', client_addr, local_port)
 
-            proxy_sock = socket()
-            proxy_sock.connect((self.proxy_host, self.proxy_port))
+                proxy_sock = socket()
+                proxy_sock.connect((self.proxy_host, self.proxy_port))
 
-            request = 'CONNECT %s HTTP/1.1\r\nProxy-Connection: keep-alive\r\n' % remote
-            if self.proxy_auth:
-                request += 'Proxy-Authorization: Basic %s\r\n' % self.proxy_auth
-            request += '\r\n'
-            proxy_sock.send(bytearray(request, 'ascii'))
+                request = 'CONNECT %s HTTP/1.1\r\nProxy-Connection: keep-alive\r\n' % remote
+                if self.proxy_auth:
+                    request += 'Proxy-Authorization: Basic %s\r\n' % self.proxy_auth
+                request += '\r\n'
+                proxy_sock.send(bytearray(request, 'ascii'))
 
-            reply_head, reply_body = proxy_sock.recv(4096).split(b'\r\n\r\n', 1)
-            reply_head = reply_head.decode('ascii').split('\r\n')[0]
-            logging.info('%s - %s', client_addr, reply_head)
+                reply_head, reply_body = proxy_sock.recv(4096).split(b'\r\n\r\n', 1)
+                reply_head = reply_head.decode('ascii').split('\r\n')[0]
+                logging.info('%s - %s', client_addr, reply_head)
 
-            if reply_head.split()[1]=='200':
-                if len(reply_body)>0:
-                    client_sock.send(reply_body)
-                Thread(target=self._transfer_loop, args=(client_sock, proxy_sock, client_addr, 'Client')).start()
-                Thread(target=self._transfer_loop, args=(proxy_sock, client_sock, client_addr, 'Server')).start()
-            else:
+                if reply_head.split()[1]=='200':
+                    if len(reply_body)>0:
+                        client_sock.send(reply_body)
+                    Thread(target=self._transfer_loop, args=(client_sock, proxy_sock, client_addr, 'Client')).start()
+                    Thread(target=self._transfer_loop, args=(proxy_sock, client_sock, client_addr, 'Server')).start()
+                else:
+                    client_sock.close()
+                    proxy_sock.close()
+            except OSError as e:
+                logging.error('Failed to accept connection: %s - %s', e.__class__.__name__, str(e))
                 client_sock.close()
                 proxy_sock.close()
 
