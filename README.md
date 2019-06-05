@@ -5,7 +5,7 @@ http-tunnel is a service, which allows you to create TCP tunnels over HTTP proxy
 Be aware, that HTTP proxy server must be configured to allow CONNECT requests to specified destination port.
 
 ### Requirements
-http-tunnel requires Python 3 and PyYAML module installed.
+http-tunnel requires Python 3.5+ and PyYAML module installed.
 
 ### Installation
 To install http-tunnel as a systemd service, just run `make install` command.
@@ -25,6 +25,6 @@ proxy:
   user: 'lorem'
   password: 'ipsum'
 tunnels:
-   2222: 'remote.server.tld:22'
-   2223: 'other.server.tld:22'
+  2222: 'remote.server.tld:22'
+  2223: 'other.server.tld:22'
 ```

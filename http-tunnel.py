@@ -1,120 +1,167 @@
 #!/usr/bin/env python3
-from argparse import ArgumentParser, FileType
-from yaml import safe_load
-from time import sleep
-from threading import Thread
-from socket import socket, setdefaulttimeout, SOL_SOCKET, SO_REUSEADDR, SHUT_RDWR
-from base64 import b64encode
+
+import argparse
+import asyncio
+import base64
 import logging
+import logging.handlers
+import signal
+import socket
+import yaml
 
 
-class TunnelServer(object):
-    def __init__(self, proxy, tunnels):
-        if type(proxy) is not dict:
-            raise TypeError('proxy must be dict, %s found' % type(proxy))
-
-        self.proxy_host = proxy.get('host', '127.0.0.1')
-        if type(self.proxy_host) is not str:
-            raise TypeError('proxy.host must be string, %s found' % type(self.proxy_host))
-
-        self.proxy_port = proxy.get('port', 3128)
-        if type(self.proxy_port) is not int:
-            raise TypeError('proxy.port must be int, %s found' % type(self.proxy_port))
-
-        proxy_user = proxy.get('user')
-        if type(proxy_user) is not str and proxy_user is not None:
-            raise TypeError('proxy.user must be string, %s found' % type(proxy_user))
-        if proxy_user is not None:
-            proxy_password = proxy.get('password', '')
-            if type(proxy_password) is not str:
-                raise TypeError('proxy.password must be string, %s found' % type(proxy_password))
-            self.proxy_auth = b64encode(bytearray('%s:%s' % (proxy_user, proxy_password), 'ascii')).decode('ascii')
-        else:
-            self.proxy_auth = None
-
-        if type(tunnels) is not dict:
-            raise TypeError('tunnels must be a dict')
+class TunnelServer:
+    def __init__(self, config_path, logger):
+        self.log = logger
+        self.proxy = {}
         self.tunnels = {}
+        self.load_config(config_path)
+        self.loop = asyncio.get_event_loop()
 
-        for local_port, remote in tunnels.items():
-            if type(local_port) is not int:
-                raise TypeError('tunnels key must be int (port number), %s found' % type(local_port))
-            if type(remote) is not str:
-                raise TypeError('tunnels value must be string (host:port), %s found' % type(remote))
+    def load_config(self, path):
+        self.log.info('Using config file: %s', path)
+        with open(path, 'r') as config_file:
+            config = yaml.safe_load(config_file) or {}
+
+        valid = True
+
+        proxy_config = config.get('proxy', {})
+        if not isinstance(proxy_config, dict):
+            self.log.critical(
+                'proxy must be dict, %s found',
+                type(proxy_config).__name__,
+            )
+            valid = False
+
+        tunnels_config = config.get('tunnels', {})
+        if not isinstance(tunnels_config, dict):
+            self.log.critical(
+                'tunnels must be dict, %s found',
+                type(tunnels_config).__name__,
+            )
+
+        if not valid:
+            raise TypeError
+
+        for option_name, option_type, option_default in [
+                ('host', str, '127.0.0.1'),
+                ('port', int, 3128),
+                ('user', str, ''),
+                ('password', str, ''),
+        ]:
+            option_value = proxy_config.get(option_name, option_default)
+            if isinstance(option_value, option_type):
+                self.proxy[option_name] = option_value
+            else:
+                self.log.critical(
+                    'proxy.%s must be %s, %s found',
+                    option_name,
+                    option_type.__name__,
+                    type(option_value).__name__,
+                )
+                valid = False
+
+        for local_port, remote in tunnels_config.items():
+            if not isinstance(local_port, int):
+                self.log.critical(
+                    'tunnels key must be int (port number), %s found',
+                    type(local_port).__name__,
+                )
+                valid = False
+                continue
+            if not isinstance(remote, str):
+                self.log.critical(
+                    'tunnels value must be string (host:port), %s found',
+                    type(remote).__name__,
+                )
+                valid = False
+                continue
             self.tunnels[local_port] = remote
 
-    def _transfer_loop(self, socket1, socket2, client_addr, side):
-        try:
-            while True:
-                buf = socket1.recv(4096)
-                if not len(buf):
-                    break
-                socket2.send(buf)
-        except (ConnectionError, OSError):
-            pass
-        try:
-            socket2.shutdown(SHUT_RDWR)
-        except OSError:
-            pass
-        logging.info('%s - %s connection closed', client_addr, side)
-        socket1.close()
+        if not valid:
+            raise TypeError
 
-    def _accept_loop(self, local_port, remote):
-        listen_sock = socket()
-        listen_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        listen_sock.bind(('0.0.0.0', local_port))
-        listen_sock.listen(10)
+    async def data_transfer(self, reader, writer, client_name, side):
         while True:
+            buf = await reader.read(4096)
+            if not buf:
+                break
+            self.log.debug('%s - %s data: %s', client_name, side, str(buf))
+            writer.write(buf)
+        writer.close()
+        self.log.info('%s - %s connection closed', client_name, side)
+
+    def get_connection_callback(self, remote):
+        async def connection_callback(client_reader, client_writer):
+            _, server_port = client_reader._transport.get_extra_info('sockname')
+            client_name = '{}:{}'.format(*client_reader._transport.get_extra_info('peername'))
+            self.log.info('%s - Conection to port %s (%s)', client_name, server_port, remote)
+
             try:
-                client_sock, client_addr = listen_sock.accept()
-                client_addr = ':'.join(map(str, client_addr))
-                logging.info('%s - Conection to port %s', client_addr, local_port)
+                proxy_reader, proxy_writer = await asyncio.open_connection(
+                    host=self.proxy['host'],
+                    port=self.proxy['port'],
+                )
+                proxy_request = 'CONNECT {} HTTP/1.1\r\n'.format(remote)
+                proxy_request += 'Proxy-Connection: keep-alive\r\n'
+                if self.proxy['user']:
+                    auth = base64.b64encode(bytearray('{user}:{password}'.format(**self.proxy), 'ascii')).decode('ascii')
+                    proxy_request += 'Proxy-Authorization: Basic {}\r\n'.format(auth)
+                proxy_request += '\r\n'
+                proxy_writer.write(bytearray(proxy_request, 'ascii'))
 
-                proxy_sock = socket()
-                proxy_sock.connect((self.proxy_host, self.proxy_port))
-
-                request = 'CONNECT %s HTTP/1.1\r\nProxy-Connection: keep-alive\r\n' % remote
-                if self.proxy_auth:
-                    request += 'Proxy-Authorization: Basic %s\r\n' % self.proxy_auth
-                request += '\r\n'
-                proxy_sock.send(bytearray(request, 'ascii'))
-
-                reply_head, reply_body = proxy_sock.recv(4096).split(b'\r\n\r\n', 1)
-                reply_head = reply_head.decode('ascii').split('\r\n')[0]
-                logging.info('%s - %s', client_addr, reply_head)
-
-                if reply_head.split()[1]=='200':
-                    if len(reply_body)>0:
-                        client_sock.send(reply_body)
-                    Thread(target=self._transfer_loop, args=(client_sock, proxy_sock, client_addr, 'Client')).start()
-                    Thread(target=self._transfer_loop, args=(proxy_sock, client_sock, client_addr, 'Server')).start()
+                proxy_reply = (await proxy_reader.readuntil(b'\r\n\r\n')).split(b'\r\n')[0].decode('ascii')
+                self.log.info('%s - Proxy reply: %s', client_name, proxy_reply)
+                if proxy_reply.split()[1] == '200':
+                    self.loop.create_task(self.data_transfer(client_reader, proxy_writer, client_name, 'Client'))
+                    self.loop.create_task(self.data_transfer(proxy_reader, client_writer, client_name, 'Server'))
                 else:
-                    client_sock.close()
-                    proxy_sock.close()
-            except OSError as e:
-                logging.error('Failed to accept connection: %s - %s', e.__class__.__name__, str(e))
-                client_sock.close()
-                proxy_sock.close()
+                    client_writer.close()
+            except OSError as exc:
+                self.log.error('%s - %s: %s', client_name, exc.__class__.__name__, str(exc))
+                client_writer.close()
+        return connection_callback
 
     def start(self):
-        accept_threads = []
-        for local_port, remote in self.tunnels.items():
-            accept_threads.append(Thread(target=self._accept_loop, args=(local_port, remote), daemon=True))
-            accept_threads[-1].start()
-        logging.info('Service started')
-        try:
-            while all([t.isAlive() for t in accept_threads]):
-                sleep(1)
-        except (InterruptedError, KeyboardInterrupt):
-            pass
-        logging.info('Service stopped')
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self.loop.add_signal_handler(signum, self.loop.stop)
+        for port, remote in self.tunnels.items():
+            self.log.info('Starting server on port %s (%s)', port, remote)
+            self.loop.run_until_complete(
+                asyncio.start_server(
+                    self.get_connection_callback(remote),
+                    port=port,
+                    family=socket.AF_INET,
+                )
+            )
+        self.loop.run_forever()
+        self.log.info('Shutdown')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('config', nargs='?', default='http-tunnel.yml')
+    parser.add_argument('--syslog', action='store_true')
+    parser.add_argument('--debug', dest='log_level', action='store_const', const='DEBUG', default='INFO')
+    args = parser.parse_args()
+
+    logger = logging.getLogger()
+    if args.syslog:
+        syslog_handler = logging.handlers.SysLogHandler(address='/dev/log')
+        syslog_handler.ident = 'http-tunnel: '
+        syslog_handler.setFormatter(logging.Formatter('%(message)s'))
+        syslog_handler.setLevel(args.log_level)
+        logger.addHandler(syslog_handler)
+    else:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+        stream_handler.setLevel(args.log_level)
+        logger.addHandler(stream_handler)
+    logger.setLevel(args.log_level)
+
+    server = TunnelServer(config_path=args.config, logger=logger)
+    server.start()
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
-    parser = ArgumentParser()
-    parser.add_argument('config', nargs='?', default = 'http-tunnel.yml')
-    with open(parser.parse_args().config) as config_file:
-        config = safe_load(config_file) or {}
-    server = TunnelServer(config.get('proxy', {}), config.get('tunnels', {}))
-    server.start()
+    main()
